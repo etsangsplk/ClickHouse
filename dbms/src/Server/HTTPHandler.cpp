@@ -179,7 +179,6 @@ void HTTPHandler::processQuery(
     if (!query_param.empty())
         query_param += '\n';
 
-
     /// User name and password can be passed using query parameters or using HTTP Basic auth (both methods are insecure).
     /// The user and password can be passed by headers (similar to X-Auth-*), which is used by load balancers to pass authentication information
     std::string user = request.get("X-ClickHouse-User", params.get("user", "default"));
