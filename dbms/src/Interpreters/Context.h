@@ -336,7 +336,7 @@ private:
 
     StoragePtr getTableImpl(const String & database_name, const String & table_name, Exception * exception) const;
 
-    SessionKey getKey(const String & session_id) const;
+    SessionKey getSessionKey(const String & session_id) const;
 };
 
 

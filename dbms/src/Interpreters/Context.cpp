@@ -131,9 +131,12 @@ struct ContextShared
     std::unique_ptr<MergeTreeSettings> merge_tree_settings;    /// Settings of MergeTree* engines.
     size_t max_table_size_to_drop = 50000000000lu;            /// Protects MergeTree tables from accidental DROP (50GB by default)
 
-    class SessionKeyHash {
+    /// Sessions with user-specified names.
+
+    class SessionKeyHash
+    {
     public:
-        size_t operator()(const Context::SessionKey& key) const
+        size_t operator()(const Context::SessionKey & key) const
         {
             size_t seed = 0;
             boost::hash_combine(seed, key.first);
@@ -898,7 +901,7 @@ ProcessList::Element * Context::getProcessListElement()
 }
 
 
-Context::SessionKey Context::getKey(const String & session_id) const
+Context::SessionKey Context::getSessionKey(const String & session_id) const
 {
     auto & user_name = client_info.current_user;
 
@@ -916,7 +919,7 @@ void Context::setSession(const String & session_id, std::shared_ptr<Context> con
     if (!context)
         throw Exception("Null context.", ErrorCodes::LOGICAL_ERROR);
 
-    const auto key = context->getKey(session_id);
+    const auto key = context->getSessionKey(session_id);
     const auto it = shared->sessions.find(key);
 
     if (it != shared->sessions.end())
@@ -931,7 +934,7 @@ std::shared_ptr<Context> Context::getSession(const String & session_id)
 {
     auto lock = getLock();
 
-    auto key = getKey(session_id);
+    auto key = getSessionKey(session_id);
     const auto it = shared->sessions.find(key);
 
     if (it == shared->sessions.end())
@@ -958,7 +961,7 @@ void Context::scheduleClose(const String & session_id, std::chrono::steady_clock
         close_cycle = new_close_cycle;
         if (shared->close_times.size() < close_index + 1)
             shared->close_times.resize(close_index + 1);
-        shared->close_times[close_index].push_back(getKey(session_id));
+        shared->close_times[close_index].emplace_back(getSessionKey(session_id));
     }
 }
 
