@@ -73,6 +73,9 @@ namespace ErrorCodes
     extern const int UNKNOWN_USER;
     extern const int WRONG_PASSWORD;
     extern const int REQUIRED_PASSWORD;
+
+    extern const int SESSION_NOT_FOUND;
+    extern const int INVALID_SESSION_TIMEOUT;
 }
 
 static Poco::Net::HTTPResponse::HTTPStatus exceptionCodeToHTTPStatus(int exception_code)
@@ -193,11 +196,51 @@ void HTTPHandler::processQuery(
     std::string quota_key = request.get("X-ClickHouse-Quota", params.get("quota_key", ""));
     std::string query_id = params.get("query_id", "");
 
-    Context context = *server.global_context;
-    context.setGlobalContext(*server.global_context);
+    std::shared_ptr<Context> context = std::make_shared<Context>(*server.global_context);
+    context->setGlobalContext(*server.global_context);
 
-    context.setUser(user, password, request.clientAddress(), quota_key);
-    context.setCurrentQueryId(query_id);
+    context->setUser(user, password, request.clientAddress(), quota_key);
+    context->setCurrentQueryId(query_id);
+
+    String session_id;
+    int session_timeout = 0;
+    bool session_is_set = params.has("session_id");
+
+    if (session_is_set)
+    {
+        session_id = params.get("session_id");
+
+        if (params.has("session_timeout"))
+        {
+            auto max_session_timeout = Poco::Util::Application::instance().config().getInt("max_session_timeout", 3600);
+            auto session_timeout_str = params.get("session_timeout");
+            session_timeout = std::stoi(session_timeout_str);
+
+            if (session_timeout < 0 || max_session_timeout < session_timeout)
+                throw Exception("Invalide session timeout '" + session_timeout_str + "', valid values are integers from 0 to " + std::to_string(max_session_timeout),
+                    ErrorCodes::INVALID_SESSION_TIMEOUT);
+        }
+        else
+        {
+            session_timeout = Poco::Util::Application::instance().config().getInt("default_session_timeout", 60);
+        }
+
+        std::shared_ptr<Context> session = context->getSession(session_id);
+
+        std::string session_check = params.get("session_check", "");
+        if (session_check == "1" && !session)
+            throw Exception("Session not found.", ErrorCodes::SESSION_NOT_FOUND);
+
+        if (session)
+        {
+            std::swap(context, session);
+        }
+        else
+        {
+            context->setSessionContext(*context);
+            context->setSession(session_id, context, std::chrono::seconds(session_timeout));
+        }
+    }
 
 
     /// The client can pass a HTTP header indicating supported compression method (gzip or deflate).
@@ -253,7 +296,7 @@ void HTTPHandler::processQuery(
 
         if (buffer_until_eof)
         {
-            std::string tmp_path_template = context.getTemporaryPath() + "http_buffers/";
+            std::string tmp_path_template = context->getTemporaryPath() + "http_buffers/";
 
             auto create_tmp_disk_buffer = [tmp_path_template] (const WriteBufferPtr &)
             {
@@ -331,7 +374,7 @@ void HTTPHandler::processQuery(
     if (startsWith(request.getContentType().data(), "multipart/form-data"))
     {
         in = std::move(in_param);
-        ExternalTablesHandler handler(context, params);
+        ExternalTablesHandler handler(*context, params);
 
         params.load(request, istr, handler);
 
@@ -358,7 +401,7 @@ void HTTPHandler::processQuery(
 
     /// In theory if initially readonly = 0, the client can change any setting and then set readonly
     /// to some other value.
-    auto & limits = context.getSettingsRef().limits;
+    auto & limits = context->getSettingsRef().limits;
 
     /// Only readonly queries are allowed for HTTP GET requests.
     if (request.getMethod() == Poco::Net::HTTPServerRequest::HTTP_GET)
@@ -370,18 +413,19 @@ void HTTPHandler::processQuery(
     auto readonly_before_query = limits.readonly;
 
     NameSet reserved_param_names{"query", "compress", "decompress", "user", "password", "quota_key", "query_id", "stacktrace",
-        "buffer_size", "wait_end_of_query"
+        "buffer_size", "wait_end_of_query",
+        "session_id", "session_timeout", "session_check"
     };
 
     for (auto it = params.begin(); it != params.end(); ++it)
     {
         if (it->first == "database")
         {
-            context.setCurrentDatabase(it->second);
+            context->setCurrentDatabase(it->second);
         }
         else if (it->first == "default_format")
         {
-            context.setDefaultFormat(it->second);
+            context->setDefaultFormat(it->second);
         }
         else if (reserved_param_names.find(it->first) != reserved_param_names.end())
         {
@@ -396,11 +440,11 @@ void HTTPHandler::processQuery(
             if (readonly_before_query && it->first == "readonly")
                 throw Exception("Setting 'readonly' cannot be overrided in readonly mode", ErrorCodes::READONLY);
 
-            context.setSetting(it->first, it->second);
+            context->setSetting(it->first, it->second);
         }
     }
 
-    const Settings & settings = context.getSettingsRef();
+    const Settings & settings = context->getSettingsRef();
 
     /// HTTP response compression is turned on only if the client signalled that they support it
     /// (using Accept-Encoding header) and 'enable_http_compression' setting is turned on.
@@ -419,7 +463,7 @@ void HTTPHandler::processQuery(
     /// Origin header.
     used_output.out->addHeaderCORS(settings.add_http_cors_header && !request.get("Origin", "").empty());
 
-    ClientInfo & client_info = context.getClientInfo();
+    ClientInfo & client_info = context->getClientInfo();
     client_info.query_kind = ClientInfo::QueryKind::INITIAL_QUERY;
     client_info.interface = ClientInfo::Interface::HTTP;
 
@@ -439,9 +483,9 @@ void HTTPHandler::processQuery(
 
     /// While still no data has been sent, we will report about query execution progress by sending HTTP headers.
     if (settings.send_progress_in_http_headers)
-        context.setProgressCallback([&used_output] (const Progress & progress) { used_output.out->onProgress(progress); });
+        context->setProgressCallback([&used_output] (const Progress & progress) { used_output.out->onProgress(progress); });
 
-    executeQuery(*in, *used_output.out_maybe_delayed_and_compressed, /* allow_into_outfile = */ false, context,
+    executeQuery(*in, *used_output.out_maybe_delayed_and_compressed, /* allow_into_outfile = */ false, *context,
         [&response] (const String & content_type) { response.setContentType(content_type); });
 
     if (used_output.hasDelayed())
@@ -449,6 +493,9 @@ void HTTPHandler::processQuery(
         /// TODO: set Content-Length if possible
         pushDelayedResults(used_output);
     }
+
+    if (session_is_set)
+        context->scheduleClose(session_id, std::chrono::seconds(session_timeout));
 
     /// Send HTTP headers with code 200 if no exception happened and the data is still not sent to
     /// the client.

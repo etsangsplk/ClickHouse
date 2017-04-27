@@ -2,6 +2,9 @@
 
 #include <functional>
 #include <memory>
+#include <thread>
+#include <mutex>
+#include <condition_variable>
 
 #include <Core/Types.h>
 #include <Core/NamesAndTypes.h>
@@ -97,6 +100,8 @@ private:
     Tables external_tables;                    /// Temporary tables.
     Context * session_context = nullptr;    /// Session context or nullptr. Could be equal to this.
     Context * global_context = nullptr;        /// Global context or nullptr. Could be equal to this.
+
+    UInt64 close_cycle = 0;
 
     using DatabasePtr = std::shared_ptr<IDatabase>;
     using Databases = std::map<String, std::shared_ptr<IDatabase>>;
@@ -244,6 +249,13 @@ public:
     /// Может вернуть nullptr, если запрос не был вставлен в ProcessList.
     ProcessListElement * getProcessListElement();
 
+    using SessionKey = std::pair<String, String>;
+
+    void setSession(const String & session_id, std::shared_ptr<Context> context, std::chrono::steady_clock::duration timeout);
+    std::shared_ptr<Context> getSession(const String & session_id);
+    void scheduleClose(const String & session_id, std::chrono::steady_clock::duration timeout);
+    std::chrono::steady_clock::duration closeSessions();
+
     /// Список всех запросов.
     ProcessList & getProcessList();
     const ProcessList & getProcessList() const;
@@ -323,6 +335,8 @@ private:
     const ExternalDictionaries & getExternalDictionariesImpl(bool throw_on_error) const;
 
     StoragePtr getTableImpl(const String & database_name, const String & table_name, Exception * exception) const;
+
+    SessionKey getKey(const String & session_id) const;
 };
 
 
@@ -342,6 +356,27 @@ private:
     Map & map;
     Map::iterator it;
     std::mutex & mutex;
+};
+
+
+class SessionCleaner
+{
+public:
+    SessionCleaner(Context & context_)
+        : context{context_}
+    {
+    }
+    ~SessionCleaner();
+
+private:
+    void run();
+
+    Context & context;
+
+    std::mutex mutex;
+    std::condition_variable cond;
+    std::thread thread{&SessionCleaner::run, this};
+    std::atomic<bool> quit{false};
 };
 
 }
